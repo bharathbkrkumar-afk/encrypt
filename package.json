@@ -1,0 +1,26 @@
+{
+  "name": "safe-mail-sender-web",
+  "version": "1.0.0",
+  "description": "Zero-Knowledge In-Browser Image Encryptor with AES-256-GCM & FastAPI Backend",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview",
+    "test:frontend": "node frontend/test_crypto.js",
+    "test:backend": "python backend/test_backend.py",
+    "test": "npm run test:frontend && npm run test:backend",
+    "backend:dev": "uvicorn backend.main:app --reload --port 8000"
+  },
+  "keywords": [
+    "image-encryptor",
+    "aes-256-gcm",
+    "web-crypto",
+    "zero-knowledge",
+    "fastapi",
+    "react",
+    "vite",
+    "typescript"
+  ],
+  "author": "Supraja Technologies",
+  "license": "MIT"
+}
