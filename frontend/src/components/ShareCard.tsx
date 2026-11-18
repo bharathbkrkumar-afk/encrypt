@@ -11,18 +11,10 @@ import {
   RefreshCw,
   Download,
   Settings,
-  ShieldCheck,
-  ExternalLink,
-  KeyRound
+  ExternalLink
 } from 'lucide-react';
 import { EncryptionResult, LogEntry } from '../types/crypto';
 import { formatBytes, downloadBlob } from '../utils/fileHelpers';
-import {
-  requestGmailAccessToken,
-  createGmailMimeMessage,
-  sendViaGmailApi,
-  loadGoogleIdentityScript
-} from '../utils/gmailService';
 
 interface ShareCardProps {
   shareData?: EncryptionResult | null;
@@ -34,10 +26,12 @@ export const ShareCard: React.FC<ShareCardProps> = ({
   shareData,
   onAddLog,
 }) => {
-  // Exactly 3 Email Input Fields State
-  const [senderEmail, setSenderEmail] = useState('');
-  const [personalMessage, setPersonalMessage] = useState('');
+  // Fixed System Sender Email (No user login or Google OAuth required)
+  const FIXED_SENDER_EMAIL = 'encryptthreeiota@gmail.com';
+
+  // Email Form State (Only Receiver Email & optional message needed from user)
   const [receiverEmail, setReceiverEmail] = useState('');
+  const [personalMessage, setPersonalMessage] = useState('');
 
   // Attached File State
   const [customFile, setCustomFile] = useState<File | null>(null);
@@ -46,18 +40,24 @@ export const ShareCard: React.FC<ShareCardProps> = ({
   const [isSending, setIsSending] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState(false);
-  const [validationErrors, setValidationErrors] = useState<{ sender?: string; receiver?: string }>({});
+  const [validationErrors, setValidationErrors] = useState<{ receiver?: string }>({});
 
-  // Google OAuth 2.0 State (Sender's Own Gmail Account)
-  const defaultClientId = (import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim();
-  const [googleClientId, setGoogleClientId] = useState<string>(() => {
-    return localStorage.getItem('image_encryptor_google_client_id') || defaultClientId;
+  // Backend Connectivity State (Centralized Gmail SMTP via FastAPI backend)
+  const defaultEnvUrl = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+  const [backendUrl, setBackendUrl] = useState<string>(() => {
+    const saved = localStorage.getItem('image_encryptor_api_url');
+    if (saved) return saved.trim().replace(/\/+$/, '');
+    if (defaultEnvUrl) return defaultEnvUrl;
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:') {
+      return '';
+    }
+    return 'http://localhost:8000';
   });
-  const [oauthToken, setOauthToken] = useState<string | null>(null);
-  const [tokenExpiresAt, setTokenExpiresAt] = useState<number | null>(null);
-  const [authorizedSender, setAuthorizedSender] = useState<string | null>(null);
-  const [showOauthSettings, setShowOauthSettings] = useState(false);
-  const [clientIdInput, setClientIdInput] = useState(googleClientId);
+
+  const [backendHealth, setBackendHealth] = useState<'idle' | 'checking' | 'online' | 'offline'>('idle');
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [customUrlInput, setCustomUrlInput] = useState(backendUrl);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -110,58 +110,64 @@ export const ShareCard: React.FC<ShareCardProps> = ({
     onAddLog('info', `Downloaded encrypted image: ${name}`);
   };
 
-  // Pre-load Google Identity script in background
-  useEffect(() => {
-    loadGoogleIdentityScript().catch(() => {});
-  }, []);
+  // Test backend connection & wake up Render if sleeping
+  const checkBackendHealth = async (urlToCheck?: string) => {
+    const target = (urlToCheck !== undefined ? urlToCheck : backendUrl).trim().replace(/\/+$/, '');
+    if (!target) {
+      setBackendHealth('offline');
+      return;
+    }
 
-  const handleSaveGoogleClientId = () => {
-    const cleaned = clientIdInput.trim();
-    setGoogleClientId(cleaned);
-    localStorage.setItem('image_encryptor_google_client_id', cleaned);
-    setShowOauthSettings(false);
-    onAddLog('info', `Google OAuth Client ID saved: ${cleaned ? cleaned.substring(0, 16) + '...' : '(cleared)'}`);
+    setBackendHealth('checking');
+    const startTime = performance.now();
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+      const res = await fetch(`${target}/api/health`, {
+        method: 'GET',
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const ms = Math.round(performance.now() - startTime);
+        setLatencyMs(ms);
+        setBackendHealth('online');
+        onAddLog('success', `Backend connected: ${target} (${ms}ms)`);
+      } else {
+        setBackendHealth('offline');
+        onAddLog('warning', `Backend at ${target} responded with HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      setBackendHealth('offline');
+      const reason = err.name === 'AbortError' ? 'Connection timeout (server may be booting)' : err.message;
+      onAddLog('warning', `Cannot reach backend at ${target} (${reason})`);
+    }
   };
 
-  // Obtains a valid Gmail OAuth access token via Google official consent popup
-  const acquireGmailToken = async (senderHint: string): Promise<string> => {
-    const activeClientId = googleClientId.trim();
-    if (!activeClientId) {
-      setShowOauthSettings(true);
-      throw new Error(
-        'Google OAuth Client ID is required to send emails directly from your Gmail account.\n\n' +
-        'Please enter your Google Client ID in the "Gmail OAuth Settings" below.'
-      );
+  // Check health on mount if backendUrl is configured
+  useEffect(() => {
+    if (backendUrl) {
+      checkBackendHealth(backendUrl);
     }
+  }, []);
 
-    // Check if current memory token is still active (with 60-second grace window)
-    if (oauthToken && tokenExpiresAt && Date.now() < tokenExpiresAt - 60000) {
-      return oauthToken;
-    }
-
-    onAddLog('info', 'Requesting Gmail authorization via Google OAuth...');
-    const result = await requestGmailAccessToken(activeClientId, senderHint);
-    setOauthToken(result.accessToken);
-    setTokenExpiresAt(Date.now() + result.expiresIn * 1000);
-    setAuthorizedSender(senderHint);
-    onAddLog('success', `Gmail account authorized for: ${senderHint}`);
-    return result.accessToken;
+  const handleSaveBackendUrl = () => {
+    const cleaned = customUrlInput.trim().replace(/\/+$/, '');
+    setBackendUrl(cleaned);
+    localStorage.setItem('image_encryptor_api_url', cleaned);
+    setShowSettings(false);
+    checkBackendHealth(cleaned);
+    onAddLog('info', `Backend API URL updated to: ${cleaned || '(empty)'}`);
   };
 
   const handleSendEmail = async (e: React.FormEvent) => {
     e.preventDefault();
     setStatusMessage(null);
 
-    // 1. Validate exactly 3 fields
-    const errors: { sender?: string; receiver?: string } = {};
-    const trimmedSender = senderEmail.trim();
+    // 1. Validate receiver email
+    const errors: { receiver?: string } = {};
     const trimmedReceiver = receiverEmail.trim();
-
-    if (!trimmedSender) {
-      errors.sender = 'Sender Email is required.';
-    } else if (!validateEmail(trimmedSender)) {
-      errors.sender = 'Please enter a valid Sender Email address (e.g. sender@gmail.com).';
-    }
 
     if (!trimmedReceiver) {
       errors.receiver = 'Receiver Email is required.';
@@ -180,54 +186,81 @@ export const ShareCard: React.FC<ShareCardProps> = ({
       return;
     }
 
+    const targetApi = backendUrl.trim().replace(/\/+$/, '');
+    if (!targetApi) {
+      setStatusMessage({
+        type: 'error',
+        text: 'Backend API URL is not configured. Please enter your Render backend URL in the "Backend Connection" settings below (e.g. https://your-service.onrender.com) or set VITE_API_URL in Vercel.'
+      });
+      setShowSettings(true);
+      return;
+    }
+
+    // Mixed Content Guard
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:' && targetApi.startsWith('http://')) {
+      setStatusMessage({
+        type: 'error',
+        text: `Mixed Content Security Block: This application is loaded over HTTPS (${window.location.origin}), but your configured Backend API URL uses insecure HTTP ("${targetApi}"). Modern browsers block this. Please use HTTPS (https://...) for your backend, or test locally.`
+      });
+      setShowSettings(true);
+      return;
+    }
+
     setIsSending(true);
+    onAddLog('info', `Dispatching encrypted image to ${trimmedReceiver} from ${FIXED_SENDER_EMAIL}...`);
 
     try {
-      // 3. Acquire Google OAuth access token for user's Gmail
-      const token = await acquireGmailToken(trimmedSender);
+      // 3. Prepare zero-knowledge form payload (without decryption key)
+      const formData = new FormData();
+      formData.append('sender_email', FIXED_SENDER_EMAIL);
+      formData.append('receiver_email', trimmedReceiver);
+      formData.append('personal_message', personalMessage.trim());
+      formData.append('filename', attachedFileName);
+      formData.append('encrypted_file', attachedBlob, attachedFileName);
 
-      onAddLog('info', `Composing RFC 2822 encrypted message for ${trimmedReceiver}...`);
-
-      // 4. Read encrypted attachment bytes in memory (never unencrypted)
-      const arrayBuffer = await attachedBlob.arrayBuffer();
-      const attachmentBytes = new Uint8Array(arrayBuffer);
-
-      // 5. Build RFC 2822 multipart email with .secimg attachment (key excluded)
-      const base64UrlMessage = createGmailMimeMessage({
-        senderEmail: trimmedSender,
-        receiverEmail: trimmedReceiver,
-        personalMessage: personalMessage.trim(),
-        attachmentFileName: attachedFileName,
-        attachmentBytes
+      // 4. Send to backend centralized dispatch endpoint
+      const response = await fetch(`${targetApi}/api/share/email`, {
+        method: 'POST',
+        body: formData,
       });
 
-      onAddLog('info', `Sending email via official Gmail API as ${trimmedSender}...`);
+      const data = await response.json().catch(() => ({}));
 
-      // 6. Dispatch via official Gmail API
-      const sendResult = await sendViaGmailApi(token, base64UrlMessage);
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new Error('Rate limit exceeded: Maximum 5 emails per minute allowed. Please wait a moment before sending another image.');
+        }
+        throw new Error(data.detail || `Server returned error status ${response.status}`);
+      }
 
       setStatusMessage({
         type: 'success',
-        text: `Email successfully dispatched from your Gmail account (${trimmedSender}) to ${trimmedReceiver}!\n\n` +
-          `• Google Message ID: ${sendResult.messageId}\n` +
+        text: `Encrypted image successfully dispatched to ${trimmedReceiver}!\n\n` +
+          `• Sent from: ${FIXED_SENDER_EMAIL}\n` +
           `• Attachment: ${attachedFileName} (AES-256-GCM Encrypted)\n\n` +
-          `Remember: The decryption key was NOT sent in the email. Please share it separately with the recipient.`
+          `Remember: The decryption key was NOT sent in the email. Please share it separately with the recipient through a private channel.`
       });
-      onAddLog('success', `Email dispatched via Gmail API (ID: ${sendResult.messageId})`);
+      setBackendHealth('online');
+      onAddLog('success', `Email dispatched to ${trimmedReceiver} from ${FIXED_SENDER_EMAIL}`);
     } catch (err: any) {
-      const errorMsg = err.message || 'An unexpected error occurred while sending the email.';
-      
-      // If token expired, clear from memory so next click prompts re-auth
-      if (errorMsg.includes('expired') || errorMsg.includes('revoked')) {
-        setOauthToken(null);
-        setTokenExpiresAt(null);
+      const rawMsg = err.message || '';
+      let friendlyText = rawMsg;
+
+      if (rawMsg.includes('Failed to fetch') || rawMsg.includes('NetworkError') || rawMsg === 'Failed to fetch') {
+        friendlyText = `Cannot reach backend API at "${targetApi}".\n\n` +
+          `Common causes & solutions:\n` +
+          `• Render Free Tier Cold Start: Services spin down after 15 min of inactivity. The first wake-up request takes 50–90 seconds. Please wait a moment and try again.\n` +
+          `• Backend URL: Verify the URL is correct and active. You can update or test the URL in Backend Settings below.\n` +
+          `• CORS: Ensure the backend allows requests from this domain.\n\n` +
+          `You can also download the encrypted image directly below to send it with your regular email client.`;
+        setBackendHealth('offline');
       }
 
       setStatusMessage({
         type: 'error',
-        text: errorMsg
+        text: friendlyText
       });
-      onAddLog('error', `Gmail sending failed: ${errorMsg}`);
+      onAddLog('error', `Email sending error: ${rawMsg}`);
     } finally {
       setIsSending(false);
     }
@@ -235,7 +268,7 @@ export const ShareCard: React.FC<ShareCardProps> = ({
 
   return (
     <div className="bg-dark-950 border border-dark-700 rounded-2xl p-6 shadow-xl space-y-6">
-      {/* Header with Gmail OAuth Status Indicator */}
+      {/* Header with Backend Status Indicator */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-dark-800 pb-4 gap-3">
         <div className="flex items-center gap-2.5">
           <div className="p-2 bg-brand-red/10 border border-brand-red/30 rounded-lg text-brand-red">
@@ -244,35 +277,34 @@ export const ShareCard: React.FC<ShareCardProps> = ({
           <div>
             <h2 className="text-lg font-bold text-white">Email Encrypted Image</h2>
             <p className="text-xs text-neutral-400">
-              Sends the encrypted .secimg file directly from your own Gmail account via official Google OAuth
+              Sends the encrypted .secimg file directly from encryptthreeiota@gmail.com
             </p>
           </div>
         </div>
 
-        {/* Gmail OAuth Status Badge & Settings Button */}
+        {/* Backend Status Badge & Settings Toggle */}
         <div className="flex items-center gap-2 self-start sm:self-auto">
           <button
             type="button"
-            onClick={() => setShowOauthSettings(!showOauthSettings)}
+            onClick={() => setShowSettings(!showSettings)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs border transition bg-dark-900 border-dark-700 hover:border-dark-600 text-neutral-300"
-            title="Configure Google OAuth Client ID"
+            title="Configure Backend Connection"
           >
-            {oauthToken ? (
+            {backendHealth === 'online' ? (
               <>
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="text-emerald-300 font-medium">
-                  Gmail Authorized {authorizedSender ? `(${authorizedSender})` : ''}
-                </span>
+                <span className="text-emerald-300 font-medium">Backend Ready</span>
+                {latencyMs && <span className="text-[10px] text-neutral-500 font-mono">({latencyMs}ms)</span>}
               </>
-            ) : googleClientId ? (
+            ) : backendHealth === 'checking' ? (
               <>
-                <span className="w-2 h-2 rounded-full bg-amber-400" />
-                <span className="text-neutral-300">Gmail OAuth Ready</span>
+                <RefreshCw className="w-3 h-3 text-amber-400 animate-spin" />
+                <span className="text-amber-300">Connecting...</span>
               </>
             ) : (
               <>
                 <span className="w-2 h-2 rounded-full bg-red-400" />
-                <span className="text-red-300">Set Google Client ID</span>
+                <span className="text-red-300">Backend Offline</span>
               </>
             )}
             <Settings className="w-3.5 h-3.5 ml-1 text-neutral-400" />
@@ -280,54 +312,47 @@ export const ShareCard: React.FC<ShareCardProps> = ({
         </div>
       </div>
 
-      {/* Expandable Google OAuth Settings Drawer */}
-      {showOauthSettings && (
+      {/* Expandable Backend Connection Settings Drawer */}
+      {showSettings && (
         <div className="p-4 bg-dark-900 border border-dark-700 rounded-xl space-y-3 text-xs">
           <div className="flex items-center justify-between">
             <span className="font-semibold text-neutral-200 flex items-center gap-1.5 text-sm">
               <Settings className="w-4 h-4 text-brand-red" />
-              Google Cloud OAuth Configuration
+              Backend Connection Settings
             </span>
-            <a
-              href="https://console.cloud.google.com/apis/credentials"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-brand-red hover:text-white flex items-center gap-1 transition text-[11px]"
+            <button
+              type="button"
+              onClick={() => checkBackendHealth(customUrlInput)}
+              className="text-brand-red hover:text-white flex items-center gap-1 transition"
             >
-              <span>Google Cloud Console</span>
-              <ExternalLink className="w-3 h-3" />
-            </a>
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Test Connection</span>
+            </button>
           </div>
 
           <p className="text-neutral-400 leading-relaxed">
-            Emails are sent directly from your own Gmail account through Google's official OAuth 2.0. 
-            To enable this, enter your <strong>Web Application OAuth 2.0 Client ID</strong> from your Google Cloud project below. 
-            No Client Secret or password is required or stored.
+            Specify the FastAPI backend URL (e.g. your deployed Render service). All emails are sent through the backend's configured Gmail account (encryptthreeiota@gmail.com).
           </p>
 
           <div className="space-y-2">
             <label className="text-[11px] font-semibold text-neutral-300 block uppercase tracking-wider">
-              Google OAuth Client ID:
+              Backend Service URL:
             </label>
             <div className="flex gap-2">
               <input
                 type="text"
-                value={clientIdInput}
-                onChange={(e) => setClientIdInput(e.target.value)}
-                placeholder="e.g. 123456789-abcdef.apps.googleusercontent.com"
+                value={customUrlInput}
+                onChange={(e) => setCustomUrlInput(e.target.value)}
+                placeholder="https://image-encryptor-api.onrender.com"
                 className="flex-1 px-3 py-2 bg-dark-950 border border-dark-700 rounded text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-brand-red"
               />
               <button
                 type="button"
-                onClick={handleSaveGoogleClientId}
+                onClick={handleSaveBackendUrl}
                 className="px-4 py-2 bg-brand-red hover:bg-brand-red-hover text-white font-medium rounded transition"
               >
                 Save
               </button>
-            </div>
-            <div className="text-[11px] text-neutral-500 space-y-1 pt-1">
-              <p>• Make sure to add this website's URL (e.g. <code className="text-amber-300 bg-dark-950 px-1 py-0.5 rounded">{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173'}</code>) under <strong>Authorized JavaScript origins</strong> in Google Cloud Console.</p>
-              <p>• Enable the <strong>Gmail API</strong> in your Google Cloud Project APIs library.</p>
             </div>
           </div>
         </div>
@@ -403,55 +428,30 @@ export const ShareCard: React.FC<ShareCardProps> = ({
         </div>
       </div>
 
-      {/* Email Form: EXACTLY 3 INPUT FIELDS */}
+      {/* Email Form: No Login Required, Sender Fixed as encryptthreeiota@gmail.com */}
       <form onSubmit={handleSendEmail} className="space-y-4">
-        {/* Field 1: Sender Email */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold uppercase tracking-wider text-neutral-300 flex items-center justify-between">
-            <span>1. Sender Email</span>
-            <span className="text-[11px] text-neutral-400 font-normal">Your Gmail address (used for Google OAuth)</span>
-          </label>
-          <input
-            type="email"
-            value={senderEmail}
-            onChange={(e) => {
-              setSenderEmail(e.target.value);
-              if (validationErrors.sender) setValidationErrors(prev => ({ ...prev, sender: undefined }));
-            }}
-            placeholder="e.g. yourname@gmail.com"
-            className={`w-full px-4 py-2.5 bg-dark-900 border rounded-lg text-sm text-white placeholder-neutral-500 focus:outline-none font-mono ${
-              validationErrors.sender
-                ? 'border-red-500 focus:border-red-500'
-                : 'border-dark-700 focus:border-brand-red'
-            }`}
-          />
-          {validationErrors.sender && (
-            <p className="text-xs text-red-400 flex items-center gap-1 mt-1">
-              <AlertCircle className="w-3.5 h-3.5" />
-              <span>{validationErrors.sender}</span>
-            </p>
-          )}
+        {/* Fixed Sender Information Banner */}
+        <div className="bg-dark-900 border border-dark-800 rounded-xl p-3.5 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-sm shadow-emerald-400/50" />
+            <div>
+              <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider block">
+                Sender Email (Automated System Dispatcher)
+              </span>
+              <span className="text-xs sm:text-sm font-mono font-medium text-emerald-300">
+                {FIXED_SENDER_EMAIL}
+              </span>
+            </div>
+          </div>
+          <span className="text-[11px] text-neutral-400 font-medium px-2.5 py-1 rounded-full bg-dark-800 border border-dark-700">
+            No Login Required
+          </span>
         </div>
 
-        {/* Field 2: Personal Message (Optional) */}
+        {/* Receiver Email (Required) */}
         <div className="space-y-1.5">
           <label className="text-xs font-semibold uppercase tracking-wider text-neutral-300 flex items-center justify-between">
-            <span>2. Personal Message (Optional)</span>
-            <span className="text-[11px] text-neutral-500 font-normal">Included in the email body</span>
-          </label>
-          <textarea
-            value={personalMessage}
-            onChange={(e) => setPersonalMessage(e.target.value)}
-            rows={3}
-            placeholder="Add an optional personal message to accompany the encrypted image..."
-            className="w-full px-4 py-2.5 bg-dark-900 border border-dark-700 rounded-lg text-sm text-white placeholder-neutral-500 focus:outline-none focus:border-brand-red resize-y"
-          />
-        </div>
-
-        {/* Field 3: Receiver Email */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold uppercase tracking-wider text-neutral-300 flex items-center justify-between">
-            <span>3. Receiver Email</span>
+            <span>Receiver Email</span>
             <span className="text-[11px] text-neutral-400 font-normal">Intended recipient address</span>
           </label>
           <input
@@ -476,7 +476,22 @@ export const ShareCard: React.FC<ShareCardProps> = ({
           )}
         </div>
 
-        {/* Action Button: Send Encrypted Image via Gmail */}
+        {/* Personal Message (Optional) */}
+        <div className="space-y-1.5">
+          <label className="text-xs font-semibold uppercase tracking-wider text-neutral-300 flex items-center justify-between">
+            <span>Personal Message (Optional)</span>
+            <span className="text-[11px] text-neutral-500 font-normal">Included in the email body</span>
+          </label>
+          <textarea
+            value={personalMessage}
+            onChange={(e) => setPersonalMessage(e.target.value)}
+            rows={3}
+            placeholder="Add an optional personal message to accompany the encrypted image..."
+            className="w-full px-4 py-2.5 bg-dark-900 border border-dark-700 rounded-lg text-sm text-white placeholder-neutral-500 focus:outline-none focus:border-brand-red resize-y"
+          />
+        </div>
+
+        {/* Action Button: Send Encrypted Image */}
         <button
           type="submit"
           disabled={isSending || !attachedBlob}
@@ -485,7 +500,7 @@ export const ShareCard: React.FC<ShareCardProps> = ({
           {isSending ? (
             <>
               <RefreshCw className="w-5 h-5 animate-spin" />
-              <span>Authorizing & Sending via Gmail...</span>
+              <span>Sending Encrypted Image...</span>
             </>
           ) : (
             <>

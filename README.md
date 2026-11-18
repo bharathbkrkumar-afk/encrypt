@@ -151,73 +151,47 @@ The frontend is a static single-page application (SPA). It requires zero server 
    - **Output Directory:** `dist`
 5. **Set Environment Variables**:
    Under **Environment Variables**, add:
-   - `VITE_GOOGLE_CLIENT_ID`: Your Google OAuth 2.0 Web Client ID (enables sending from users' own Gmail accounts).
-   - `VITE_API_URL`: (Optional) Your live Render backend URL (e.g. `https://your-service.onrender.com`).
-   *(Note: You can also configure or test both the Google Client ID and Backend URL directly in the web UI under the settings pills without redeploying).*
+   - `VITE_API_URL`: Your live Render backend URL (e.g. `https://your-service.onrender.com`).
+   *(Note: You can also configure or test the Backend URL directly in the web UI under the "Backend Connection" settings without redeploying).*
 6. Click **Deploy**. Your zero-knowledge Image Encryptor will be live with free SSL.
 
 *(Note: `frontend/vercel.json` is pre-configured with SPA rewrites to ensure direct URL refreshes work seamlessly).*
 
 ---
 
-### B. Google Cloud OAuth 2.0 Setup (For User Gmail Sending)
+### B. Deploy Backend on Render (Centralized Email Service)
 
-To enable users to send encrypted `.secimg` attachments directly from their own Gmail accounts using Google's official OAuth:
-
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a new project (e.g. `Image-Encryptor-Web`).
-3. Navigate to **APIs & Services** → **Library**, search for **Gmail API**, and click **Enable**.
-4. Go to **APIs & Services** → **OAuth consent screen**:
-   - Choose **External** user type.
-   - Fill in the App name (e.g. `Image Encryptor`) and your developer contact email.
-   - In **Scopes**, add `https://www.googleapis.com/auth/gmail.send` (Send emails on your behalf).
-   - In **Test users**, add your own Gmail address (or publish the app to Production for any Google user).
-5. Go to **APIs & Services** → **Credentials** → **Create Credentials** → **OAuth client ID**:
-   - **Application type:** `Web application`.
-   - **Name:** `Image Encryptor Web Client`.
-   - **Authorized JavaScript origins:**
-     - `http://localhost:5173` (for local development)
-     - `https://your-app.vercel.app` (your production Vercel URL)
-6. Copy the generated **Client ID** (e.g. `123456789-abcdef.apps.googleusercontent.com`).
-7. Paste this Client ID into:
-   - The web UI's **Gmail OAuth Settings** drawer, OR
-   - `frontend/.env` as `VITE_GOOGLE_CLIENT_ID`, OR
-   - Vercel's Environment Variables.
-
-*(Note: No Client Secret is needed or exposed in the frontend. Google Identity Services uses the Client ID with Authorized Origins for secure browser-side token authorization).*
-
----
-
-### B. Deploy Backend on Render (Optional)
-
-The backend is completely optional because encryption and decryption happen client-side in the browser. Deploy the backend to Render only if you want:
+The backend provides centralized zero-knowledge email delivery of the encrypted `.secimg` attachments using your configured Gmail account:
 - Zero-knowledge ephemeral file relay (`/api/share/transit`).
-- Backend SMTP email delivery of the encrypted `.secimg` attachment (`/api/share/email`).
+- Centralized Gmail SMTP delivery of encrypted attachments (`/api/share/email`).
+- From header is locked to your configured Gmail address (preventing spoofing).
+- Reply-To is automatically set to the user's entered sender email.
+- Decryption keys and plaintext images never touch the backend.
 
 > **Render Free Tier Notice:** Free web services on Render automatically spin down after 15 minutes of inactivity. When inactive, the first incoming request takes **50 to 90 seconds** while the container boots up. The web application includes an automatic status check and helpful diagnostic notices so you know when the backend is waking up.
 
-#### Method 1: Using `render.yaml` Blueprint (Recommended)
-1. Push your repository to GitHub.
-2. In the [Render Dashboard](https://dashboard.render.com/), click **New** -> **Blueprint**.
-3. Connect your repository. Render will automatically detect `backend/render.yaml` and configure the service.
-4. Click **Apply**.
+#### 1. Setup Your Gmail App Password
+1. In your Google Account, enable **2-Step Verification** (if not already enabled).
+2. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+3. Create a new App Password (name it e.g. `Image Encryptor`).
+4. Copy the generated 16-character password (e.g. `abcd efgh ijkl mnop`).
 
-#### Method 2: Manual Web Service
-1. In Render, select **New Web Service**.
-2. Connect your repo and set:
+#### 2. Configure Render Web Service
+1. In the [Render Dashboard](https://dashboard.render.com/), select your Web Service (or click **New** -> **Web Service**).
+2. Set:
    - **Root Directory:** `backend`
    - **Environment:** `Python 3`
    - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
    - **Plan:** Free
-3. Add Environment Variables:
+3. Add Environment Variables in Render:
    - `CORS_ORIGINS`: `https://*.vercel.app,http://localhost:3000,http://localhost:5173`
-   - `SMTP_SERVER`: (e.g. `smtp.gmail.com` if enabling email dispatch)
-   - `SMTP_PORT`: `587` (TLS) or `465` (SSL)
-   - `SENDER_EMAIL`: (Your authenticated SMTP sender address)
-   - `SENDER_PASSWORD`: (Your SMTP App Password)
-4. Click **Create Web Service**.
-5. Once deployed, copy your Render URL (e.g., `https://your-app.onrender.com`) and paste it into the **Backend Connection Settings** in the Image Encryptor web app or set it as `VITE_API_URL` on Vercel.
+   - `SMTP_EMAIL`: `your-gmail@gmail.com` (Your Gmail address used for centralized sending)
+   - `SMTP_APP_PASSWORD`: `your-16-char-app-password` (Your 16-character Gmail App Password)
+   - `SMTP_SERVER`: `smtp.gmail.com`
+   - `SMTP_PORT`: `587`
+4. Click **Save Changes** (or **Create Web Service**).
+5. Once deployed, copy your Render URL (e.g., `https://your-app.onrender.com`) and paste it as `VITE_API_URL` on Vercel or in the web UI.
 
 ---
 

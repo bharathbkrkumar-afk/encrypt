@@ -10,7 +10,7 @@ from email.mime.text import MIMEText
 from email import encoders
 from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
@@ -43,12 +43,31 @@ app.add_middleware(
   max_age=86400,
 )
 
-# In-memory ephemeral storage for zero-knowledge transit relay (expires in 24 hours)
-# Format: { transit_id: { "filename": str, "content": bytes, "expires_at": float } }
+# Ephemeral in-memory storage & default sender configuration
+DEFAULT_SENDER_EMAIL = "encryptthreeiota@gmail.com"
 transit_storage: Dict[str, Dict[str, Any]] = {}
 TRANSIT_TTL_SECONDS = 86400  # 24 hours
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB safety limit
 MAX_CONCURRENT_TRANSITS = 100  # memory exhaustion protection
+
+# In-memory sliding window rate limiter for email abuse prevention
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 5
+email_rate_limit: Dict[str, list] = {}
+
+
+def check_rate_limit(client_id: str):
+  """Enforces maximum emails per time window to prevent abuse and spam."""
+  now = time.time()
+  timestamps = [t for t in email_rate_limit.get(client_id, []) if now - t < RATE_LIMIT_WINDOW_SECONDS]
+  if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+    raise HTTPException(
+      status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+      detail=f"Rate limit exceeded: Maximum {RATE_LIMIT_MAX_REQUESTS} emails per minute allowed. Please wait before sending another image."
+    )
+  timestamps.append(now)
+  email_rate_limit[client_id] = timestamps
+
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -105,30 +124,40 @@ def health_check():
 
 @app.post("/api/share/email")
 async def dispatch_encrypted_email(
-  sender_email: str = Form(..., description="Email address of the sender"),
+  request: Request,
   receiver_email: str = Form(..., description="Email address of the intended recipient"),
+  sender_email: Optional[str] = Form(None, description="Optional sender email; defaults to encryptthreeiota@gmail.com"),
   personal_message: Optional[str] = Form(None, description="Optional personal message from sender"),
   filename: str = Form(..., description="Name of the encrypted file attachment"),
   encrypted_file: UploadFile = File(..., description="The client-side encrypted image file (.secimg)")
 ):
   """
-  Dispatches a client-side encrypted image file to a recipient email.
+  Dispatches a client-side encrypted image file to a recipient email using centralized Gmail SMTP.
   
-  CRITICAL ZERO-KNOWLEDGE CONSTRAINTS:
+  CRITICAL ZERO-KNOWLEDGE & SECURITY CONSTRAINTS:
   - This endpoint NEVER receives, accepts, or stores any decryption key.
   - The server explicitly checks that the attached file is NOT an unencrypted image.
   - Decryption keys must be shared by the sender out-of-band (e.g. via SMS, Signal, WhatsApp).
-  - All SMTP credentials are read strictly from backend environment variables.
+  - All SMTP credentials are read strictly from backend environment variables (SMTP_EMAIL / SMTP_APP_PASSWORD).
+  - The 'From' address is locked to the configured Gmail address (no spoofing allowed).
+  - Rate limiting is enforced per client IP and recipient to prevent abuse.
   """
-  sender = sender_email.strip()
+  sender = (sender_email or DEFAULT_SENDER_EMAIL).strip()
+  if not sender:
+    sender = DEFAULT_SENDER_EMAIL
   receiver = receiver_email.strip()
   message_text = (personal_message or "").strip()
 
-  # 1. Validate both email addresses
+  # 1. Rate limiting check (client IP & receiver email)
+  client_ip = request.client.host if request and request.client else "unknown"
+  check_rate_limit(f"ip:{client_ip}")
+  check_rate_limit(f"receiver:{receiver.lower()}")
+
+  # 2. Validate email addresses
   validate_email_address(sender, "Sender Email")
   validate_email_address(receiver, "Receiver Email")
 
-  # 2. Read and validate encrypted file payload
+  # 3. Read and validate encrypted file payload
   encrypted_bytes = await encrypted_file.read()
   if len(encrypted_bytes) < 32:
     raise HTTPException(status_code=400, detail="Invalid encrypted file payload: file is too small.")
@@ -138,7 +167,7 @@ async def dispatch_encrypted_email(
 
   safe_filename = sanitize_filename(filename)
 
-  # 3. Security check: Ensure payload is NOT a raw unencrypted image (PNG/JPEG/GIF/WebP magic check)
+  # 4. Security check: Ensure payload is NOT a raw unencrypted image (PNG/JPEG/GIF/WebP magic check)
   if (
     encrypted_bytes.startswith(b"\x89PNG\r\n\x1a\n") or
     encrypted_bytes.startswith(b"\xff\xd8\xff") or
@@ -150,25 +179,25 @@ async def dispatch_encrypted_email(
       detail="Security Violation: Raw unencrypted image detected. The file must be encrypted client-side using AES-256-GCM before dispatch."
     )
 
-  # 4. Load SMTP credentials from backend environment variables ONLY
-  smtp_server = os.getenv("SMTP_SERVER")
+  # 5. Load centralized Gmail SMTP credentials from backend environment variables ONLY
+  smtp_server = (os.getenv("SMTP_SERVER") or "smtp.gmail.com").strip()
   smtp_port = int(os.getenv("SMTP_PORT", "587"))
-  backend_smtp_sender = os.getenv("SENDER_EMAIL")
-  sender_password = os.getenv("SENDER_PASSWORD")
+  smtp_email = (os.getenv("SMTP_EMAIL") or os.getenv("SENDER_EMAIL") or DEFAULT_SENDER_EMAIL).strip()
+  smtp_password = (os.getenv("SMTP_APP_PASSWORD") or os.getenv("SENDER_PASSWORD") or "").strip()
 
-  if not all([smtp_server, backend_smtp_sender, sender_password]):
+  if not smtp_password:
     return JSONResponse(
       status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
       content={
         "status": "smtp_unconfigured",
         "detail": (
-          "Backend SMTP service is not currently configured with server credentials. "
-          "Please download the encrypted file and send it directly from your email client."
+          "Centralized email service is not configured on the server. "
+          "The server administrator must configure SMTP_APP_PASSWORD in Render environment variables."
         )
       }
     )
 
-  # 5. Domain DNS check with timeout to prevent asyncio event-loop blocking
+  # 6. Domain DNS check with timeout to prevent asyncio event-loop blocking
   try:
     receiver_domain = receiver.split("@")[-1]
     socket.setdefaulttimeout(3.0)
@@ -178,173 +207,27 @@ async def dispatch_encrypted_email(
     # proceed to SMTP server which performs authoritative recipient validation.
     pass
 
-  # 6. Compose secure email
+  # 7. Compose secure email
   try:
     msg = MIMEMultipart()
-    # Format 'From' with sender display name and Reply-To for seamless conversation
-    msg["From"] = f"{sender} via Image Encryptor <{backend_smtp_sender}>"
-    msg["Reply-To"] = sender
+    # From is locked to the configured Gmail address (no spoofing)
+    msg["From"] = f"Image Encryptor <{smtp_email}>"
+    # Reply-To is set to the system sender or specified sender
+    msg["Reply-To"] = sender if sender != smtp_email else smtp_email
     msg["To"] = receiver
-    msg["Subject"] = f"Secure Encrypted Image from {sender}"
+    # Subject as specifically requested
+    msg["Subject"] = "Image Encryptor – Secure Image"
 
     # Build clear body with sender/receiver details and security notice
     body_lines = [
       "======================================================================",
       "                  SECURE ENCRYPTED IMAGE FILE                         ",
-      "           Powered by Supraja Technologies • AES-256-GCM              ",
+      "               Image Encryptor • AES-256-GCM                          ",
       "======================================================================",
       "",
-      "SENDER DETAILS:",
-      f"  From: {sender}",
-      "",
-      "RECEIVER DETAILS:",
-      f"  To:   {receiver}",
-      "",
-    ]
-
-    if message_text:
-      body_lines.extend([
-        "PERSONAL MESSAGE FROM SENDER:",
-        f"  \"{message_text}\"",
-        "",
-      ])
-
-    body_lines.extend([
-      "ATTACHMENT INFORMATION:",
-      f"  Encrypted File: {filename}",
-      "  Cipher:         AES-256-GCM Authenticated Encryption",
-      "",
-      "----------------------------------------------------------------------",
-      "IMPORTANT ZERO-KNOWLEDGE SECURITY NOTICE:",
-      "----------------------------------------------------------------------",
-      "1. The encrypted image file is attached to this email.",
-      "2. For zero-knowledge confidentiality, the DECRYPTION KEY IS NOT",
-      "   INCLUDED in this email.",
-      "3. The sender must provide you with the secret decryption key via a",
-      "   separate, private communication channel (e.g. Signal, WhatsApp,",
-      "   SMS, or in person).",
-      "4. Once you receive the key, visit the Image Encryptor web tool,",
-      "   navigate to 'Decrypt Image', drop this attached file, and enter",
-      "   the decryption key to restore the original image.",
-      "======================================================================",
-    ])
-
-    body_text = "\n".join(body_lines)
-    msg.attach(MIMEText(body_text, "plain", "utf-8"))
-
-    # Attach the encrypted image in memory (never written to disk or database)
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(encrypted_bytes)
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
-    msg.attach(part)
-
-    # Connect and send via SMTP (Support both 465 SSL and 587 STARTTLS)
-    if smtp_port == 465:
-      server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
-    else:
-      server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-      server.starttls()
-
-    server.login(backend_smtp_sender, sender_password)
-    server.sendmail(backend_smtp_sender, receiver, msg.as_string())
-    server.quit()
-
-    return {
-      "success": True,
-      "message": f"Encrypted image successfully emailed to {receiver} from {sender}."
-    }
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=f"SMTP dispatch failed: {str(e)}")
-
-
-@app.options("/api/share/email")
-def options_share_email():
-  return Response(
-    status_code=200,
-    headers={
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
-    }
-  )
-
-
-@app.options("/api/gmail/send")
-def options_gmail_send():
-  return Response(
-    status_code=200,
-    headers={
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
-    }
-  )
-
-
-@app.post("/api/gmail/send")
-async def send_via_user_gmail(
-  access_token: str = Form(..., description="Ephemeral Google OAuth Access Token for gmail.send"),
-  sender_email: str = Form(..., description="Authenticated user's Gmail address"),
-  receiver_email: str = Form(..., description="Recipient email address"),
-  personal_message: Optional[str] = Form(None, description="Optional personal message"),
-  filename: str = Form(..., description="Name of the encrypted file attachment"),
-  encrypted_file: UploadFile = File(..., description="The client-side encrypted image file (.secimg)")
-):
-  """
-  Dispatches an email through Google's official Gmail API using the sender's own Gmail account and OAuth token.
-  The server never stores the token, plaintext images, or decryption keys.
-  """
-  import json
-  import urllib.request
-  import urllib.error
-  import base64
-
-  sender = sender_email.strip()
-  receiver = receiver_email.strip()
-  message_text = (personal_message or "").strip()
-
-  validate_email_address(sender, "Sender Email")
-  validate_email_address(receiver, "Receiver Email")
-
-  encrypted_bytes = await encrypted_file.read()
-  if len(encrypted_bytes) < 32:
-    raise HTTPException(status_code=400, detail="Invalid encrypted file payload: file is too small.")
-
-  if len(encrypted_bytes) > MAX_FILE_SIZE_BYTES:
-    raise HTTPException(status_code=413, detail="File too large. Maximum supported encrypted file size is 50MB.")
-
-  # Security check: Ensure payload is NOT a raw unencrypted image
-  if (
-    encrypted_bytes.startswith(b"\x89PNG\r\n\x1a\n") or
-    encrypted_bytes.startswith(b"\xff\xd8\xff") or
-    encrypted_bytes.startswith(b"GIF8") or
-    (encrypted_bytes.startswith(b"RIFF") and b"WEBP" in encrypted_bytes[:16])
-  ):
-    raise HTTPException(
-      status_code=400,
-      detail="Security Violation: Raw unencrypted image detected. The file must be encrypted client-side using AES-256-GCM before dispatch."
-    )
-
-  safe_filename = sanitize_filename(filename)
-
-  try:
-    msg = MIMEMultipart()
-    msg["From"] = sender
-    msg["To"] = receiver
-    msg["Subject"] = f"Secure Encrypted Image from {sender}"
-
-    body_lines = [
-      "======================================================================",
-      "                  SECURE ENCRYPTED IMAGE FILE                         ",
-      "           Powered by Supraja Technologies • AES-256-GCM              ",
-      "======================================================================",
-      "",
-      "SENDER DETAILS:",
-      f"  From: {sender}",
-      "",
-      "RECEIVER DETAILS:",
-      f"  To:   {receiver}",
+      "DISPATCH DETAILS:",
+      f"  From:     {smtp_email} (Image Encryptor Secure Dispatcher)",
+      f"  To:       {receiver}",
       "",
     ]
 
@@ -366,9 +249,9 @@ async def send_via_user_gmail(
       "1. The encrypted image file is attached to this email.",
       "2. For zero-knowledge confidentiality, the DECRYPTION KEY IS NOT",
       "   INCLUDED in this email.",
-      "3. The sender must provide you with the secret decryption key via a",
-      "   separate, private communication channel (e.g. Signal, WhatsApp,",
-      "   SMS, or in person).",
+      "3. The sender must provide you with the secret decryption",
+      "   key via a separate, private communication channel (e.g. Signal,",
+      "   WhatsApp, SMS, or in person).",
       "4. Once you receive the key, visit the Image Encryptor web tool,",
       "   navigate to 'Decrypt Image', drop this attached file, and enter",
       "   the decryption key to restore the original image.",
@@ -378,41 +261,42 @@ async def send_via_user_gmail(
     body_text = "\n".join(body_lines)
     msg.attach(MIMEText(body_text, "plain", "utf-8"))
 
+    # Attach the encrypted image in memory only (never written to disk or database)
     part = MIMEBase("application", "octet-stream")
     part.set_payload(encrypted_bytes)
     encoders.encode_base64(part)
     part.add_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
     msg.attach(part)
 
-    # Encode to base64url for Gmail API
-    raw_bytes = msg.as_bytes()
-    raw_b64url = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+    # Connect and send via Gmail SMTP (Support both 465 SSL and 587 STARTTLS)
+    if smtp_port == 465:
+      server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
+    else:
+      server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+      server.starttls()
 
-    # Call official Gmail API endpoint
-    req = urllib.request.Request(
-      "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-      data=json.dumps({"raw": raw_b64url}).encode("utf-8"),
-      headers={
-        "Authorization": f"Bearer {access_token.strip()}",
-        "Content-Type": "application/json"
-      },
-      method="POST"
-    )
+    server.login(smtp_email, smtp_password)
+    server.sendmail(smtp_email, receiver, msg.as_string())
+    server.quit()
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
-      response_data = json.loads(resp.read().decode("utf-8"))
-      return {
-        "success": True,
-        "message": f"Encrypted image successfully dispatched from {sender} via Gmail API.",
-        "id": response_data.get("id")
-      }
-  except urllib.error.HTTPError as e:
-    err_body = e.read().decode("utf-8", errors="ignore")
-    if e.code == 401:
-      raise HTTPException(status_code=401, detail="Gmail authorization token has expired or is invalid.")
-    raise HTTPException(status_code=e.code, detail=f"Gmail API error ({e.code}): {err_body}")
+    return {
+      "success": True,
+      "message": f"Encrypted image successfully dispatched to {receiver} from {sender}."
+    }
   except Exception as e:
-    raise HTTPException(status_code=500, detail=f"Gmail dispatch failed: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"SMTP dispatch failed: {str(e)}")
+
+
+@app.options("/api/share/email")
+def options_share_email():
+  return Response(
+    status_code=200,
+    headers={
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+    }
+  )
 
 
 @app.post("/api/share/transit")

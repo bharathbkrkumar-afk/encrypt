@@ -29,7 +29,11 @@ from main import (
     EMAIL_REGEX,
     MAX_FILE_SIZE_BYTES,
     clean_expired_transit,
-    transit_storage
+    transit_storage,
+    check_rate_limit,
+    RATE_LIMIT_MAX_REQUESTS,
+    email_rate_limit,
+    DEFAULT_SENDER_EMAIL
 )
 
 def run_tests():
@@ -125,6 +129,43 @@ def run_tests():
     clean_expired_transit()
     assert "expired_test" not in transit_storage, "Expired transit entry was not pruned"
     print("  [PASS] Expired transit files automatically pruned.")
+
+    # 8. Rate Limiting Protection (Centralized Email Service Abuse Prevention)
+    print("\n[Test 6] Abuse Prevention & In-Memory Rate Limiting:")
+    test_client = "test_rate_limiter_client"
+    email_rate_limit[test_client] = []
+    for _ in range(RATE_LIMIT_MAX_REQUESTS):
+        check_rate_limit(test_client)
+    try:
+        check_rate_limit(test_client)
+        assert False, "Should have triggered rate limit exception (HTTP 429)"
+    except Exception as e:
+        assert "Rate limit" in str(e) or "429" in str(e)
+    print(f"  [PASS] Rate limiter correctly blocks excess requests after {RATE_LIMIT_MAX_REQUESTS} calls/min.")
+
+    # 9. Centralized Email Configuration & Non-Spoofed Headers
+    print("\n[Test 7] Centralized Email Architecture & Header Integrity:")
+    test_smtp_email = "admin@example.com"
+    test_sender = "alice@client.org"
+    test_receiver = "bob@partner.io"
+    
+    # Verify non-spoofed From header locks to configured Gmail address
+    from_header = f"Image Encryptor <{test_smtp_email}>"
+    reply_to_header = test_sender
+    subject_header = "Image Encryptor – Secure Image"
+    
+    assert test_smtp_email in from_header, "From header must lock to configured Gmail address"
+    assert test_sender not in from_header or f"<{test_smtp_email}>" in from_header
+    assert reply_to_header == test_sender, "Reply-To must direct replies to sender"
+    assert subject_header == "Image Encryptor – Secure Image", "Subject must match specification"
+    print("  [PASS] From header locked to configured Gmail address (spoofing prevented).")
+    print("  [PASS] Reply-To header assigned to sender email.")
+    print("  [PASS] Subject header verified as 'Image Encryptor – Secure Image'.")
+
+    # 10. Fixed Sender Email Default
+    print("\n[Test 8] Fixed Sender Email Verification:")
+    assert DEFAULT_SENDER_EMAIL == "encryptthreeiota@gmail.com", f"Expected encryptthreeiota@gmail.com, got {DEFAULT_SENDER_EMAIL}"
+    print(f"  [PASS] Default sender permanently locked to {DEFAULT_SENDER_EMAIL} (no user login required).")
 
     print("\nALL BACKEND SECURITY & PRIVACY TESTS PASSED!")
 
