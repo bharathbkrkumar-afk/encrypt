@@ -24,6 +24,6 @@
   "author": "Supraja Technologies",
   "license": "MIT",
   "dependencies": {
-    "nodemailer": "^6.9.16"
+    "nodemailer": "^6.10.1"
   }
 }

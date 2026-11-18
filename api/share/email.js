@@ -4,7 +4,7 @@ const DEFAULT_SENDER_EMAIL = 'encryptthreeiota@gmail.com';
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 
-module.exports = async function handler(req, res) {
+async function handler(req, res) {
   // CORS headers for all responses
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -21,12 +21,19 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // Parse multipart/form-data manually from the raw body
-    const chunks = [];
-    for await (const chunk of req) {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    // Collect body bytes (whether pre-buffered or incoming stream)
+    let rawBody;
+    if (Buffer.isBuffer(req.body)) {
+      rawBody = req.body;
+    } else if (typeof req.body === 'string') {
+      rawBody = Buffer.from(req.body);
+    } else {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      }
+      rawBody = Buffer.concat(chunks);
     }
-    const rawBody = Buffer.concat(chunks);
 
     if (rawBody.length > MAX_FILE_SIZE) {
       return res.status(413).json({ detail: 'File too large. Maximum 50MB.' });
@@ -177,7 +184,16 @@ module.exports = async function handler(req, res) {
     const msg = error.message || 'Unknown error';
     return res.status(500).json({ detail: 'Email sending failed: ' + msg });
   }
+}
+
+handler.config = {
+  api: {
+    bodyParser: false,
+  },
 };
+
+module.exports = handler;
+module.exports.config = handler.config;
 
 // --- Helper: split a Buffer by a delimiter Buffer ---
 function splitBuffer(buf, delimiter) {

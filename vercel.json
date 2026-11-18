@@ -2,18 +2,21 @@
   "installCommand": "npm install && npm --prefix frontend install",
   "buildCommand": "npm --prefix frontend run build",
   "outputDirectory": "frontend/dist",
-  "functions": {
-    "api/**/*.js": {
-      "runtime": "@vercel/node@3"
-    }
-  },
   "rewrites": [
     {
-      "source": "/api/(.*)",
-      "destination": "/api/$1"
+      "source": "/api/health",
+      "destination": "/api/health.js"
     },
     {
-      "source": "/((?!api/).*)",
+      "source": "/api/share/email",
+      "destination": "/api/share/email.js"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1.js"
+    },
+    {
+      "source": "/(.*)",
       "destination": "/index.html"
     }
   ],
