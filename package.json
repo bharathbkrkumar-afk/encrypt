@@ -22,5 +22,8 @@
     "typescript"
   ],
   "author": "Supraja Technologies",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  }
 }
