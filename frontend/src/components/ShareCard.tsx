@@ -110,20 +110,19 @@ export const ShareCard: React.FC<ShareCardProps> = ({
     onAddLog('info', `Downloaded encrypted image: ${name}`);
   };
 
-  // Test backend connection & wake up Render if sleeping
+  // Test backend connection & wake up backend if sleeping
   const checkBackendHealth = async (urlToCheck?: string) => {
-    const target = (urlToCheck !== undefined ? urlToCheck : backendUrl).trim().replace(/\/+$/, '');
-    if (!target) {
-      setBackendHealth('offline');
-      return;
-    }
+    const rawTarget = urlToCheck !== undefined ? urlToCheck : backendUrl;
+    const target = (rawTarget || '').trim().replace(/\/+$/, '');
+    const healthUrl = target ? `${target}/api/health` : '/api/health';
+    const displayTarget = target || (typeof window !== 'undefined' && window.location.origin ? window.location.origin : 'Same-Origin API');
 
     setBackendHealth('checking');
     const startTime = performance.now();
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 12000);
-      const res = await fetch(`${target}/api/health`, {
+      const res = await fetch(healthUrl, {
         method: 'GET',
         signal: controller.signal,
       });
@@ -133,23 +132,21 @@ export const ShareCard: React.FC<ShareCardProps> = ({
         const ms = Math.round(performance.now() - startTime);
         setLatencyMs(ms);
         setBackendHealth('online');
-        onAddLog('success', `Backend connected: ${target} (${ms}ms)`);
+        onAddLog('success', `Backend connected: ${displayTarget} (${ms}ms)`);
       } else {
         setBackendHealth('offline');
-        onAddLog('warning', `Backend at ${target} responded with HTTP ${res.status}`);
+        onAddLog('warning', `Backend at ${displayTarget} responded with HTTP ${res.status}`);
       }
     } catch (err: any) {
       setBackendHealth('offline');
       const reason = err.name === 'AbortError' ? 'Connection timeout (server may be booting)' : err.message;
-      onAddLog('warning', `Cannot reach backend at ${target} (${reason})`);
+      onAddLog('warning', `Cannot reach backend at ${displayTarget} (${reason})`);
     }
   };
 
-  // Check health on mount if backendUrl is configured
+  // Check health on mount
   useEffect(() => {
-    if (backendUrl) {
-      checkBackendHealth(backendUrl);
-    }
+    checkBackendHealth(backendUrl);
   }, []);
 
   const handleSaveBackendUrl = () => {
@@ -187,14 +184,7 @@ export const ShareCard: React.FC<ShareCardProps> = ({
     }
 
     const targetApi = backendUrl.trim().replace(/\/+$/, '');
-    if (!targetApi) {
-      setStatusMessage({
-        type: 'error',
-        text: 'Backend API URL is not configured. Please enter your Render backend URL in the "Backend Connection" settings below (e.g. https://your-service.onrender.com) or set VITE_API_URL in Vercel.'
-      });
-      setShowSettings(true);
-      return;
-    }
+    const sendEndpoint = targetApi ? `${targetApi}/api/share/email` : '/api/share/email';
 
     // Mixed Content Guard
     if (typeof window !== 'undefined' && window.location.protocol === 'https:' && targetApi.startsWith('http://')) {
@@ -219,7 +209,7 @@ export const ShareCard: React.FC<ShareCardProps> = ({
       formData.append('encrypted_file', attachedBlob, attachedFileName);
 
       // 4. Send to backend centralized dispatch endpoint
-      const response = await fetch(`${targetApi}/api/share/email`, {
+      const response = await fetch(sendEndpoint, {
         method: 'POST',
         body: formData,
       });
@@ -246,7 +236,13 @@ export const ShareCard: React.FC<ShareCardProps> = ({
       const rawMsg = err.message || '';
       let friendlyText = rawMsg;
 
-      if (rawMsg.includes('Failed to fetch') || rawMsg.includes('NetworkError') || rawMsg === 'Failed to fetch') {
+      if (rawMsg.includes('Network is unreachable') || rawMsg.includes('101')) {
+        friendlyText = `Render Free Tier SMTP Restriction Detected:\n\n` +
+          `Render explicitly blocks outbound SMTP ports (25, 465, and 587) on its Free tier to prevent spam, resulting in [Errno 101] Network is unreachable.\n\n` +
+          `Permanent Free Fix:\n` +
+          `1. Delete or clear the Backend URL in "Backend Connection Settings" below (or clear VITE_API_URL on Vercel).\n` +
+          `2. Image Encryptor will automatically use Vercel Serverless where outbound Gmail SMTP ports are completely open and 100% free!`;
+      } else if (rawMsg.includes('Failed to fetch') || rawMsg.includes('NetworkError') || rawMsg === 'Failed to fetch') {
         friendlyText = `Cannot reach backend API at "${targetApi}".\n\n` +
           `Common causes & solutions:\n` +
           `• Render Free Tier Cold Start: Services spin down after 15 min of inactivity. The first wake-up request takes 50–90 seconds. Please wait a moment and try again.\n` +

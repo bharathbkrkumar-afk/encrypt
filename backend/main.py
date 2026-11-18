@@ -183,7 +183,9 @@ async def dispatch_encrypted_email(
   smtp_server = (os.getenv("SMTP_SERVER") or "smtp.gmail.com").strip()
   smtp_port = int(os.getenv("SMTP_PORT", "587"))
   smtp_email = (os.getenv("SMTP_EMAIL") or os.getenv("SENDER_EMAIL") or DEFAULT_SENDER_EMAIL).strip()
-  smtp_password = (os.getenv("SMTP_APP_PASSWORD") or os.getenv("SENDER_PASSWORD") or "").strip()
+  raw_password = (os.getenv("SMTP_APP_PASSWORD") or os.getenv("SENDER_PASSWORD") or "").strip()
+  # Google App Passwords are 16 letters, often displayed with spaces (e.g. 'abcd efgh ijkl mnop')
+  smtp_password = raw_password.replace(" ", "")
 
   if not smtp_password:
     return JSONResponse(
@@ -268,12 +270,25 @@ async def dispatch_encrypted_email(
     part.add_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
     msg.attach(part)
 
-    # Connect and send via Gmail SMTP (Support both 465 SSL and 587 STARTTLS)
-    if smtp_port == 465:
-      server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
-    else:
-      server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-      server.starttls()
+    # Connect and send via Gmail SMTP (Support both 465 SSL and 587 STARTTLS with auto-fallback)
+    server = None
+    last_conn_error = None
+    ports_to_try = [smtp_port, 465 if smtp_port != 465 else 587]
+
+    for port in ports_to_try:
+      try:
+        if port == 465:
+          server = smtplib.SMTP_SSL(smtp_server, 465, timeout=15)
+        else:
+          server = smtplib.SMTP(smtp_server, 587, timeout=15)
+          server.starttls()
+        break
+      except Exception as conn_err:
+        last_conn_error = conn_err
+        server = None
+
+    if server is None:
+      raise last_conn_error or Exception("Could not connect to SMTP server.")
 
     server.login(smtp_email, smtp_password)
     server.sendmail(smtp_email, receiver, msg.as_string())
@@ -284,7 +299,17 @@ async def dispatch_encrypted_email(
       "message": f"Encrypted image successfully dispatched to {receiver} from {sender}."
     }
   except Exception as e:
-    raise HTTPException(status_code=500, detail=f"SMTP dispatch failed: {str(e)}")
+    err_str = str(e)
+    if "101" in err_str or "Network is unreachable" in err_str:
+      raise HTTPException(
+        status_code=500,
+        detail=(
+          "SMTP dispatch failed: [Errno 101] Network is unreachable. "
+          "Render's Free Tier blocks outbound SMTP traffic on ports 25, 465, and 587 to prevent spam. "
+          "To send directly, use the Vercel API endpoint or upgrade your Render instance."
+        )
+      )
+    raise HTTPException(status_code=500, detail=f"SMTP dispatch failed: {err_str}")
 
 
 @app.options("/api/share/email")
