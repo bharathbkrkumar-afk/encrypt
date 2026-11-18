@@ -10,7 +10,6 @@ import {
   Upload,
   RefreshCw,
   Download,
-  Settings,
   ExternalLink
 } from 'lucide-react';
 import { EncryptionResult, LogEntry } from '../types/crypto';
@@ -56,8 +55,6 @@ export const ShareCard: React.FC<ShareCardProps> = ({
 
   const [backendHealth, setBackendHealth] = useState<'idle' | 'checking' | 'online' | 'offline'>('idle');
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
-  const [customUrlInput, setCustomUrlInput] = useState(backendUrl);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -132,15 +129,11 @@ export const ShareCard: React.FC<ShareCardProps> = ({
         const ms = Math.round(performance.now() - startTime);
         setLatencyMs(ms);
         setBackendHealth('online');
-        onAddLog('success', `Backend connected: ${displayTarget} (${ms}ms)`);
       } else {
         setBackendHealth('offline');
-        onAddLog('warning', `Backend at ${displayTarget} responded with HTTP ${res.status}`);
       }
-    } catch (err: any) {
+    } catch {
       setBackendHealth('offline');
-      const reason = err.name === 'AbortError' ? 'Connection timeout (server may be booting)' : err.message;
-      onAddLog('warning', `Cannot reach backend at ${displayTarget} (${reason})`);
     }
   };
 
@@ -148,15 +141,6 @@ export const ShareCard: React.FC<ShareCardProps> = ({
   useEffect(() => {
     checkBackendHealth(backendUrl);
   }, []);
-
-  const handleSaveBackendUrl = () => {
-    const cleaned = customUrlInput.trim().replace(/\/+$/, '');
-    setBackendUrl(cleaned);
-    localStorage.setItem('image_encryptor_api_url', cleaned);
-    setShowSettings(false);
-    checkBackendHealth(cleaned);
-    onAddLog('info', `Backend API URL updated to: ${cleaned || '(empty)'}`);
-  };
 
   const handleSendEmail = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -192,7 +176,6 @@ export const ShareCard: React.FC<ShareCardProps> = ({
         type: 'error',
         text: `Mixed Content Security Block: This application is loaded over HTTPS (${window.location.origin}), but your configured Backend API URL uses insecure HTTP ("${targetApi}"). Modern browsers block this. Please use HTTPS (https://...) for your backend, or test locally.`
       });
-      setShowSettings(true);
       return;
     }
 
@@ -237,17 +220,12 @@ export const ShareCard: React.FC<ShareCardProps> = ({
       let friendlyText = rawMsg;
 
       if (rawMsg.includes('Network is unreachable') || rawMsg.includes('101')) {
-        friendlyText = `Render Free Tier SMTP Restriction Detected:\n\n` +
-          `Render explicitly blocks outbound SMTP ports (25, 465, and 587) on its Free tier to prevent spam, resulting in [Errno 101] Network is unreachable.\n\n` +
-          `Permanent Free Fix:\n` +
-          `1. Delete or clear the Backend URL in "Backend Connection Settings" below (or clear VITE_API_URL on Vercel).\n` +
-          `2. Image Encryptor will automatically use Vercel Serverless where outbound Gmail SMTP ports are completely open and 100% free!`;
+        friendlyText = `SMTP Connection Error:\n\n` +
+          `Failed to connect to the mail server. Please ensure the server has network connectivity to Gmail SMTP.\n\n` +
+          `You can always download the encrypted image directly below to send it with your regular email client.`;
       } else if (rawMsg.includes('Failed to fetch') || rawMsg.includes('NetworkError') || rawMsg === 'Failed to fetch') {
-        friendlyText = `Cannot reach backend API at "${targetApi}".\n\n` +
-          `Common causes & solutions:\n` +
-          `• Render Free Tier Cold Start: Services spin down after 15 min of inactivity. The first wake-up request takes 50–90 seconds. Please wait a moment and try again.\n` +
-          `• Backend URL: Verify the URL is correct and active. You can update or test the URL in Backend Settings below.\n` +
-          `• CORS: Ensure the backend allows requests from this domain.\n\n` +
+        friendlyText = `Cannot reach backend API.\n\n` +
+          `Please check your internet connection or try again in a few moments.\n\n` +
           `You can also download the encrypted image directly below to send it with your regular email client.`;
         setBackendHealth('offline');
       }
@@ -278,14 +256,9 @@ export const ShareCard: React.FC<ShareCardProps> = ({
           </div>
         </div>
 
-        {/* Backend Status Badge & Settings Toggle */}
+        {/* Backend Status Badge */}
         <div className="flex items-center gap-2 self-start sm:self-auto">
-          <button
-            type="button"
-            onClick={() => setShowSettings(!showSettings)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs border transition bg-dark-900 border-dark-700 hover:border-dark-600 text-neutral-300"
-            title="Configure Backend Connection"
-          >
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs border bg-dark-900 border-dark-700 text-neutral-300">
             {backendHealth === 'online' ? (
               <>
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
@@ -303,56 +276,9 @@ export const ShareCard: React.FC<ShareCardProps> = ({
                 <span className="text-red-300">Backend Offline</span>
               </>
             )}
-            <Settings className="w-3.5 h-3.5 ml-1 text-neutral-400" />
-          </button>
+          </div>
         </div>
       </div>
-
-      {/* Expandable Backend Connection Settings Drawer */}
-      {showSettings && (
-        <div className="p-4 bg-dark-900 border border-dark-700 rounded-xl space-y-3 text-xs">
-          <div className="flex items-center justify-between">
-            <span className="font-semibold text-neutral-200 flex items-center gap-1.5 text-sm">
-              <Settings className="w-4 h-4 text-brand-red" />
-              Backend Connection Settings
-            </span>
-            <button
-              type="button"
-              onClick={() => checkBackendHealth(customUrlInput)}
-              className="text-brand-red hover:text-white flex items-center gap-1 transition"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>Test Connection</span>
-            </button>
-          </div>
-
-          <p className="text-neutral-400 leading-relaxed">
-            Specify the FastAPI backend URL (e.g. your deployed Render service). All emails are sent through the backend's configured Gmail account (encryptthreeiota@gmail.com).
-          </p>
-
-          <div className="space-y-2">
-            <label className="text-[11px] font-semibold text-neutral-300 block uppercase tracking-wider">
-              Backend Service URL:
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={customUrlInput}
-                onChange={(e) => setCustomUrlInput(e.target.value)}
-                placeholder="https://image-encryptor-api.onrender.com"
-                className="flex-1 px-3 py-2 bg-dark-950 border border-dark-700 rounded text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-brand-red"
-              />
-              <button
-                type="button"
-                onClick={handleSaveBackendUrl}
-                className="px-4 py-2 bg-brand-red hover:bg-brand-red-hover text-white font-medium rounded transition"
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Automatically Attached File Status */}
       <div className="bg-dark-900 border border-dark-700 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
